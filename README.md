@@ -23,8 +23,12 @@ if ok:
 
 ## Install
 
+Not on PyPI yet — install from source:
+
 ```bash
-pip install schema-drift[postgresql]   # or [mysql], [sqlserver], [all]
+git clone https://github.com/dioghras/schema-drift
+cd schema-drift
+pip install -e ".[postgresql]"   # or [mysql], [sqlserver], [all]
 ```
 
 Drivers are imported lazily inside each connector, so you install only the one matching the database you actually use. The library itself has **no required dependencies**.
