@@ -72,6 +72,22 @@ This is the price of the rollback approach. A throwaway-database strategy would 
 
 Detection, drift analysis, and SQL generation all work fine on MySQL — you get the script, reviewed and run by a human. It is only the automated verify-then-apply path that is closed. **Reporting an honest refusal is treated as the correct outcome, not a gap to paper over.** A verification that silently passes because it couldn't actually check anything is worse than no verification at all, because someone will trust it.
 
+### Known limitation: verification proves execution, not correctness
+
+The dry run answers one question — *will these statements run against this schema?* It does not answer *should they?* Those come apart, and it is worth seeing how badly.
+
+An early version of the SQLAlchemy collector misread nullability: it defaulted to nullable for any column without an explicit `nullable=` kwarg, missing that SQLAlchemy 2.0 puts that information in the `Mapped[...]` annotation. Pointed at a real 2.0 codebase, it concluded that every `NOT NULL` column in the database was drift, and generated 77 statements to reconcile it:
+
+```sql
+ALTER TABLE "users" ALTER COLUMN "email" DROP NOT NULL;
+ALTER TABLE "users" ALTER COLUMN "hashed_password" DROP NOT NULL;
+...
+```
+
+**`verify_ddl` passed all 77.** It was right to. Dropping a constraint is valid SQL that executes cleanly against that schema and rolls back without complaint. Verification did exactly its job while confirming a migration that would have stripped the integrity constraints off an entire database.
+
+That bug is fixed (and now has the test coverage it should have had). The limitation it exposed is not, because it can't be: **verification is a check on the generated SQL, never on the analysis that produced it.** Garbage in, verified garbage out. Treat a passing dry run as "this will not error," not as "this is safe to apply" — the review step in front of it is load-bearing, which is why nothing here applies a migration without one.
+
 ## Architecture
 
 Four stages, each usable on its own:
