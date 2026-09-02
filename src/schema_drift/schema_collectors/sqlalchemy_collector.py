@@ -16,7 +16,8 @@ from schema_drift.schema_collectors.base import (
 RE_CLASS = re.compile(r"class\s+(\w+)\(.*(?:Base|Model).*\)")
 RE_TABLENAME = re.compile(r'__tablename__\s*=\s*["\'](\w+)["\']')
 RE_MAPPED_COL = re.compile(
-    r"(\w+)\s*(?::\s*Mapped\[.*?\])?\s*=\s*mapped_column\(((?:[^()]*|\([^()]*\))*)\)",
+    r"(\w+)\s*(?::\s*Mapped\[((?:[^\[\]]|\[[^\[\]]*\])*)\])?\s*=\s*"
+    r"mapped_column\(((?:[^()]*|\([^()]*\))*)\)",
     re.DOTALL,
 )
 RE_COLUMN = re.compile(
@@ -26,6 +27,9 @@ RE_FK = re.compile(r'ForeignKey\(["\'](\w+)\.(\w+)["\']')
 RE_INDEX = re.compile(r"index\s*=\s*True")
 RE_PK = re.compile(r"primary_key\s*=\s*True")
 RE_NULLABLE = re.compile(r"nullable\s*=\s*(True|False)")
+# SQLAlchemy 2.0 encodes nullability in the annotation: Mapped[str] is NOT NULL,
+# Mapped[str | None] / Mapped[Optional[str]] are nullable.
+RE_ANNOTATION_NONE = re.compile(r"\|\s*None\b|\bNone\s*\||\bOptional\[")
 RE_TYPE = re.compile(r"(String|Integer|Boolean|Float|DateTime|Text|UUID|BigInteger|Numeric|JSON)")
 RE_STRING_LEN = re.compile(r"String\((\d+)\)")
 
@@ -101,11 +105,13 @@ class SQLAlchemySchemaCollector(BaseSchemaCollector):
 
             # Try mapped_column style first (SQLAlchemy 2.0)
             for col_match in RE_MAPPED_COL.finditer(block):
-                col = self._parse_column(col_match.group(1), col_match.group(2))
+                col = self._parse_column(
+                    col_match.group(1), col_match.group(3), col_match.group(2)
+                )
                 if col:
                     columns.append(col)
 
-            # Try Column() style (SQLAlchemy 1.x)
+            # Try Column() style (SQLAlchemy 1.x) — no annotation to read
             for col_match in RE_COLUMN.finditer(block):
                 col = self._parse_column(col_match.group(1), col_match.group(2))
                 if col:
@@ -122,7 +128,9 @@ class SQLAlchemySchemaCollector(BaseSchemaCollector):
 
         return tables
 
-    def _parse_column(self, name: str, definition: str) -> ColumnDefinition | None:
+    def _parse_column(
+        self, name: str, definition: str, annotation: str | None = None
+    ) -> ColumnDefinition | None:
         if name.startswith("_"):
             return None
 
@@ -133,8 +141,16 @@ class SQLAlchemySchemaCollector(BaseSchemaCollector):
         max_length = int(strlen_match.group(1)) if strlen_match else None
 
         is_pk = bool(RE_PK.search(definition))
+        # An explicit nullable= kwarg wins; otherwise the Mapped[...] annotation
+        # decides (2.0 style); otherwise fall back to "everything but the PK is
+        # nullable", which is all a bare Column() tells us.
         nullable_match = RE_NULLABLE.search(definition)
-        nullable = nullable_match.group(1) == "True" if nullable_match else not is_pk
+        if nullable_match:
+            nullable = nullable_match.group(1) == "True"
+        elif annotation:
+            nullable = bool(RE_ANNOTATION_NONE.search(annotation))
+        else:
+            nullable = not is_pk
 
         fk_match = RE_FK.search(definition)
         is_fk = bool(fk_match)
