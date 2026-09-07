@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # pyproject declares requires-python >=3.12, so every version it claims
+      # to support is tested. This matrix is not padding: the collectors parse
+      # source text with the standard library, and a interpreter-level change
+      # in parsing behaviour is exactly the kind of break that otherwise shows
+      # up only on a contributor's machine.
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Run tests
+        # No database service: the collectors parse source text and the drift
+        # and migration tests work against in-memory fixtures. Connectors are
+        # the only DB-touching code and they import their drivers lazily.
+        run: uv run --python ${{ matrix.python-version }} --extra dev pytest -q
+
+  build:
+    name: Build (wheel + sdist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Build distributions
+        # The README tells people to install from source, so a packaging
+        # mistake is a first-contact failure. Cheap to catch here.
+        run: uv build
+
+      - name: Check the built package is installable and imports
+        run: |
+          uv venv /tmp/verify
+          VIRTUAL_ENV=/tmp/verify uv pip install dist/*.whl
+          /tmp/verify/bin/python -c "import schema_drift; print('import ok')"

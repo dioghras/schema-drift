@@ -1,5 +1,9 @@
 # schema-drift
 
+[![CI](https://github.com/dioghras/schema-drift/actions/workflows/ci.yml/badge.svg)](https://github.com/dioghras/schema-drift/actions/workflows/ci.yml)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/dioghras/schema-drift)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 Your ORM models say one thing. Your production database says another. `schema-drift` finds the difference and writes the SQL that closes it. It parses entity definitions straight out of a source tree — **SQLAlchemy, Django, EF Core, Hibernate, GORM, ActiveRecord, or Eloquent** — reads the real schema out of a live **PostgreSQL, MySQL, or SQL Server** database, diffs the two, and generates dialect-aware DDL to reconcile them.
 
 The interesting part is what it refuses to do. Generating migration SQL is the easy half; the hard half is being trustworthy enough to point at a production database. So the generator is **additive-only** — it will `CREATE TABLE`, `ADD COLUMN`, and widen a `NOT NULL` to nullable, but a `DROP` or a `NOT NULL` tightening is emitted as a **commented-out line with a warning** and never as something you can accidentally execute. And before any statement runs, it is proved against the live schema by a dry run inside a transaction that is **always rolled back**. Nothing is applied that hasn't already been shown to work on the actual current schema.
