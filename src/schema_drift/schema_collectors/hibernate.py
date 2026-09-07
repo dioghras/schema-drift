@@ -23,6 +23,12 @@ RE_GENERATED = re.compile(r"@GeneratedValue")
 RE_JOIN_COLUMN = re.compile(r'@JoinColumn\s*\(\s*name\s*=\s*"(\w+)"')
 RE_NULLABLE = re.compile(r"nullable\s*=\s*(true|false)")
 RE_LENGTH = re.compile(r"length\s*=\s*(\d+)")
+RE_ENTITY_CLASS = re.compile(r"@Entity\b")
+RE_COLUMN_NAME = re.compile(r'@Column\s*\([^)]*name\s*=\s*"(\w+)"')
+RE_TRANSIENT = re.compile(r"@Transient\b")
+RE_TO_ONE = re.compile(r"@(?:ManyToOne|OneToOne)\b")
+
+COLLECTION_PREFIXES = ("List", "Set", "Collection", "Map", "SortedSet")
 
 
 class HibernateSchemaCollector(BaseSchemaCollector):
@@ -51,9 +57,9 @@ class HibernateSchemaCollector(BaseSchemaCollector):
             if not content or not RE_ENTITY.search(content):
                 continue
 
-            table = self._parse_entity(content, str(path.relative_to(root)))
-            if table:
-                snapshot.tables.append(table)
+            tables = self._parse_entity(content, str(path.relative_to(root)))
+            if tables:
+                snapshot.tables.extend(tables)
                 snapshot.raw_files_parsed += 1
 
         migration_files = self._find_files(project_path, self.migration_file_patterns())
@@ -69,60 +75,114 @@ class HibernateSchemaCollector(BaseSchemaCollector):
 
         return snapshot
 
-    def _parse_entity(self, content: str, file_path: str) -> TableDefinition | None:
-        class_match = RE_CLASS.search(content)
-        if not class_match:
-            return None
+    @staticmethod
+    def _snake(name: str) -> str:
+        """Spring Boot's CamelCaseToUnderscoresNamingStrategy."""
+        out = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+        out = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", out)
+        return out.lower()
 
-        class_name = class_match.group(1)
+    @staticmethod
+    def _entity_blocks(content: str) -> list[tuple[str, str, str]]:
+        """Yield (class_name, annotations_before, body) for each @Entity class.
 
-        table_match = RE_TABLE.search(content)
-        table_name = table_match.group(1) if table_match else class_name.lower() + "s"
-
-        columns = []
-        lines = content.split("\n")
-        for i, line in enumerate(lines):
-            field_match = RE_FIELD.search(line)
-            if not field_match:
+        Java files usually hold one public class, but @Entity on a second
+        class in the same file was silently dropped: the old parser called
+        RE_CLASS.search once and took whatever came first.
+        """
+        blocks: list[tuple[str, str, str]] = []
+        for match in RE_CLASS.finditer(content):
+            open_idx = content.find("{", match.end())
+            if open_idx == -1:
                 continue
-
-            field_type, field_name = field_match.group(1), field_match.group(2)
-
-            # Skip collection fields
-            if field_type.startswith(("List", "Set", "Collection")):
+            depth, close_idx = 0, -1
+            for i in range(open_idx, len(content)):
+                if content[i] == "{":
+                    depth += 1
+                elif content[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        close_idx = i
+                        break
+            if close_idx == -1:
                 continue
+            preceding = content[: match.start()]
+            annotations = preceding[preceding.rfind("}") + 1 :] if "}" in preceding else preceding
+            if not RE_ENTITY_CLASS.search(annotations):
+                continue
+            blocks.append((match.group(1), annotations, content[open_idx + 1 : close_idx]))
+        return blocks
 
-            preceding = "\n".join(lines[max(0, i - 5):i + 1])
+    def _parse_entity(self, content: str, file_path: str) -> list[TableDefinition]:
+        tables: list[TableDefinition] = []
 
-            is_pk = bool(RE_ID.search(preceding))
-            join_match = RE_JOIN_COLUMN.search(preceding)
-            is_fk = bool(join_match)
+        for class_name, annotations, body in self._entity_blocks(content):
+            table_match = RE_TABLE.search(annotations)
+            # Hibernate does not pluralize. The old default lowercased the
+            # class and appended "s", so AuditRecord became "auditrecords" —
+            # a table no schema has, reported as missing on every run.
+            table_name = table_match.group(1) if table_match else self._snake(class_name)
 
-            nullable = True
-            null_match = RE_NULLABLE.search(preceding)
-            if null_match:
-                nullable = null_match.group(1) == "true"
+            fields = list(RE_FIELD.finditer(body))
+            columns: list[ColumnDefinition] = []
 
-            max_length = None
-            len_match = RE_LENGTH.search(preceding)
-            if len_match:
-                max_length = int(len_match.group(1))
+            for i, field in enumerate(fields):
+                field_type, field_name = field.group(1), field.group(2)
 
-            columns.append(
-                ColumnDefinition(
-                    name=field_name,
-                    data_type=field_type,
-                    nullable=nullable,
-                    is_primary_key=is_pk,
-                    is_foreign_key=is_fk,
-                    max_length=max_length,
+                # Annotations belong to the field they precede. The old
+                # five-line window leaked @Id, nullable and length onto
+                # whichever field happened to follow.
+                region_start = fields[i - 1].end() if i else 0
+                annos = body[region_start : field.start()]
+
+                if RE_TRANSIENT.search(annos):
+                    continue
+                if field_type.startswith(COLLECTION_PREFIXES):
+                    continue
+
+                is_pk = bool(RE_ID.search(annos))
+                join_match = RE_JOIN_COLUMN.search(annos)
+                is_fk = bool(join_match) or bool(RE_TO_ONE.search(annos))
+
+                column_match = RE_COLUMN_NAME.search(annos)
+                if column_match:
+                    col_name = column_match.group(1)
+                elif join_match:
+                    col_name = join_match.group(1)
+                elif is_fk:
+                    # @ManyToOne with no @JoinColumn: JPA derives <field>_<pk>.
+                    col_name = f"{self._snake(field_name)}_id"
+                else:
+                    col_name = self._snake(field_name)
+
+                # JPA's @Column(nullable) defaults to true; a primary key is
+                # never nullable regardless.
+                null_match = RE_NULLABLE.search(annos)
+                nullable = null_match.group(1) == "true" if null_match else True
+                if is_pk:
+                    nullable = False
+
+                len_match = RE_LENGTH.search(annos)
+
+                columns.append(
+                    ColumnDefinition(
+                        name=col_name,
+                        data_type=field_type,
+                        nullable=nullable,
+                        is_primary_key=is_pk,
+                        is_foreign_key=is_fk,
+                        max_length=int(len_match.group(1)) if len_match else None,
+                    )
                 )
-            )
 
-        if not columns:
-            return None
+            if columns:
+                tables.append(
+                    TableDefinition(
+                        name=table_name, columns=columns, source_file=file_path
+                    )
+                )
 
-        return TableDefinition(name=table_name, columns=columns, source_file=file_path)
+        return tables
 
     def _read_file(self, path: Path) -> str | None:
         try:
