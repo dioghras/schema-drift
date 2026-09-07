@@ -11,7 +11,17 @@ from schema_drift.schema_collectors.base import (
     TableDefinition,
 )
 
-RE_CREATE_TABLE = re.compile(r'create_table\s+"(\w+)".*?do\s*\|t\|(.*?)end', re.DOTALL)
+# Group 2 is the options between the table name and the block — "id: false",
+# "primary_key: \"uuid\"" and friends live there and decide whether Rails adds
+# a key column of its own.
+RE_CREATE_TABLE = re.compile(
+    r'create_table\s+"(\w+)"([^\n]*?)do\s*\|t\|(.*?)end', re.DOTALL
+)
+RE_ID_FALSE = re.compile(r"\bid:\s*false\b")
+RE_PRIMARY_KEY_OPT = re.compile(r'\bprimary_key:\s*"(\w+)"')
+# t.timestamps takes no column name, so the t.<type> "name" pattern skips it
+# entirely — and with it the two columns Rails actually creates.
+RE_TIMESTAMPS = re.compile(r"^\s*t\.timestamps\b(.*)$", re.MULTILINE)
 RE_COLUMN = re.compile(r't\.(\w+)\s+"(\w+)"(?:\s*,\s*(.+?))?$', re.MULTILINE)
 RE_INDEX = re.compile(r'add_index\s+"(\w+)"\s*,\s*\[([^\]]+)\]')
 RE_MIGRATION_CLASS = re.compile(r"class\s+(\w+)\s*<\s*ActiveRecord::Migration")
@@ -62,8 +72,23 @@ class ActiveRecordSchemaCollector(BaseSchemaCollector):
 
         for table_match in RE_CREATE_TABLE.finditer(content):
             table_name = table_match.group(1)
-            body = table_match.group(2)
+            options = table_match.group(2) or ""
+            body = table_match.group(3)
             columns = []
+
+            # Rails creates a primary key unless told not to. It never appears
+            # as a t.<type> line, so reading only those lines produced a table
+            # with no key — and a CREATE TABLE without one, for a new database.
+            if not RE_ID_FALSE.search(options):
+                pk_match = RE_PRIMARY_KEY_OPT.search(options)
+                columns.append(
+                    ColumnDefinition(
+                        name=pk_match.group(1) if pk_match else "id",
+                        data_type="bigint",
+                        nullable=False,
+                        is_primary_key=True,
+                    )
+                )
 
             for col_match in RE_COLUMN.finditer(body):
                 col_type = col_match.group(1)
@@ -87,11 +112,29 @@ class ActiveRecordSchemaCollector(BaseSchemaCollector):
                         name=col_name,
                         data_type=col_type,
                         nullable=nullable,
-                        is_primary_key=col_name == "id",
+                        # The key column is synthesised above from the
+                        # create_table options, not matched here.
+                        is_primary_key=False,
                         is_foreign_key=is_fk,
                         max_length=max_length,
                     )
                 )
+
+            # t.timestamps expands to created_at/updated_at, NOT NULL since
+            # Rails 5. Both are real columns in every database Rails builds.
+            ts_match = RE_TIMESTAMPS.search(body)
+            if ts_match:
+                # NOT NULL is the default since Rails 5; only an explicit
+                # null: true relaxes it.
+                ts_nullable = "null: true" in ts_match.group(1)
+                for name in ("created_at", "updated_at"):
+                    columns.append(
+                        ColumnDefinition(
+                            name=name,
+                            data_type="datetime",
+                            nullable=ts_nullable,
+                        )
+                    )
 
             if columns:
                 tables.append(TableDefinition(name=table_name, columns=columns, source_file=file_path))
