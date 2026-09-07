@@ -12,9 +12,30 @@ from schema_drift.schema_collectors.base import (
 )
 
 RE_STRUCT = re.compile(r"type\s+(\w+)\s+struct\s*\{")
-RE_FIELD = re.compile(r"\s+(\w+)\s+([\w.*\[\]]+)\s*`([^`]*)`")
+# The tag is optional. Requiring it dropped every field carrying only a
+# `json:` tag, or none at all — GORM maps those as columns just the same.
+RE_FIELD = re.compile(r"^\s*(\w+)\s+([\w.*\[\]]+)\s*(?:`([^`]*)`)?\s*$", re.MULTILINE)
+
+# GORM pluralises with the inflection package. These are the rules that bite
+# in practice; anything else takes a trailing "s".
+IRREGULAR_PLURALS = {
+    "person": "people",
+    "man": "men",
+    "woman": "women",
+    "child": "children",
+    "tooth": "teeth",
+    "foot": "feet",
+    "mouse": "mice",
+    "goose": "geese",
+}
 RE_GORM_TAG = re.compile(r'gorm:"([^"]*)"')
-RE_TABLE_NAME_FUNC = re.compile(r'func\s*\(\w*\s*\*?(\w+)\)\s*TableName\s*\(\)\s*string\s*\{\s*return\s*"(\w+)"')
+# Both receiver forms occur, and the unnamed one — func (Order) TableName() —
+# is the idiomatic spelling. The old pattern's leading \w* swallowed the type
+# name in that form, leaving the capture group with its final letter: "Order"
+# was read as "r", so the override never matched a struct and was ignored.
+RE_TABLE_NAME_FUNC = re.compile(
+    r'func\s*\(\s*(?:\w+\s+)?\*?(\w+)\s*\)\s*TableName\s*\(\)\s*string\s*\{\s*return\s*"(\w+)"'
+)
 
 
 class GORMSchemaCollector(BaseSchemaCollector):
@@ -79,6 +100,8 @@ class GORMSchemaCollector(BaseSchemaCollector):
             struct_body = content[start:pos]
 
             # Check if any field has gorm tags
+            # A struct with no gorm tags anywhere is unlikely to be a model;
+            # requiring a tag on each *field*, though, is what lost columns.
             if "gorm:" not in struct_body:
                 continue
 
@@ -90,17 +113,20 @@ class GORMSchemaCollector(BaseSchemaCollector):
                 field_type = field_match.group(2)
                 tags = field_match.group(3)
 
+                tags = tags or ""
                 gorm_match = RE_GORM_TAG.search(tags)
-                if not gorm_match:
+                gorm_tag = gorm_match.group(1) if gorm_match else ""
+
+                tag_parts = {p.split(":")[0].strip(): p.split(":", 1)[1].strip() if ":" in p else ""
+                             for p in gorm_tag.split(";")} if gorm_tag else {}
+
+                if "-" in tag_parts:  # gorm:"-" means: not a column
                     continue
 
-                gorm_tag = gorm_match.group(1)
-                tag_parts = {p.split(":")[0].strip(): p.split(":", 1)[1].strip() if ":" in p else ""
-                             for p in gorm_tag.split(";")}
-
                 is_pk = "primaryKey" in tag_parts or "primarykey" in tag_parts
-                col_name = tag_parts.get("column", self._to_snake(field_name))
-                nullable = "not null" not in gorm_tag.lower()
+                col_name = tag_parts.get("column") or self._to_snake(field_name)
+                # A primary key is NOT NULL whether or not the tag says so.
+                nullable = "not null" not in gorm_tag.lower() and not is_pk
 
                 columns.append(
                     ColumnDefinition(
@@ -124,9 +150,24 @@ class GORMSchemaCollector(BaseSchemaCollector):
         return s.lower()
 
     def _to_snake_plural(self, name: str) -> str:
+        """GORM's default table name: snake_case, pluralised by inflection.
+
+        Appending a bare "s" produced "categorys", "boxs" and "persons" —
+        names no database has, so every such table read as missing.
+        """
         snake = self._to_snake(name)
+
+        head, _, tail = snake.rpartition("_")
+        if tail in IRREGULAR_PLURALS:
+            plural = IRREGULAR_PLURALS[tail]
+            return f"{head}_{plural}" if head else plural
+
         if snake.endswith("s"):
             return snake
+        if re.search(r"[^aeiou]y$", snake):
+            return snake[:-1] + "ies"
+        if re.search(r"(s|x|z|ch|sh)$", snake):
+            return snake + "es"
         return snake + "s"
 
     def _read_file(self, path: Path) -> str | None:
