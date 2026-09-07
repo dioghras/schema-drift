@@ -17,8 +17,16 @@ RE_FIELD = re.compile(r"(\w+)\s*=\s*models\.(\w+(?:Field|Key))\(((?:[^()]*|\([^(
 RE_MAXLEN = re.compile(r"max_length\s*=\s*(\d+)")
 RE_NULL = re.compile(r"null\s*=\s*(True|False)")
 RE_PK = re.compile(r"primary_key\s*=\s*True")
-RE_FK_TO = re.compile(r"models\.ForeignKey\(\s*['\"]?(\w+)['\"]?")
+# A relation's target may be quoted and app-qualified ("billing.Account"),
+# quoted and bare ("Account"), the literal "self", or an unquoted class name.
+RE_FK_TO = re.compile(
+    r"models\.(?:ForeignKey|OneToOneField)\(\s*(?:['\"]([\w.]+)['\"]|(\w+))"
+)
 RE_DB_INDEX = re.compile(r"db_index\s*=\s*True")
+
+# Meta options that change what — or whether — a table is called.
+RE_DB_TABLE = re.compile(r"db_table\s*=\s*['\"]([^'\"]+)['\"]")
+RE_ABSTRACT = re.compile(r"abstract\s*=\s*True")
 
 # Django migration patterns
 RE_CREATE_MODEL = re.compile(r"migrations\.CreateModel\(\s*name=['\"](\w+)['\"]")
@@ -66,6 +74,26 @@ class DjangoSchemaCollector(BaseSchemaCollector):
     def migration_file_patterns(self) -> list[str]:
         return ["**/migrations/0*.py"]
 
+    @staticmethod
+    def _app_label(rel_path: Path) -> str | None:
+        """The Django app a models file belongs to, from its location.
+
+        Django names a table ``<app_label>_<modelname>``, and the app label
+        defaults to the app package's directory name. Both layouts occur:
+
+            myapp/models.py          -> myapp
+            myapp/models/order.py    -> myapp   (never "models")
+
+        Returns None for a models.py sitting at the project root, where there
+        is no app package to name.
+        """
+        parts = rel_path.parts
+        if len(parts) >= 3 and parts[-2] == "models":
+            return parts[-3]
+        if len(parts) >= 2 and parts[-1] == "models.py":
+            return parts[-2]
+        return None
+
     def collect_schema(self, project_path: str) -> SchemaSnapshot:
         snapshot = SchemaSnapshot(orm_type=self.orm_type())
         root = Path(project_path)
@@ -79,8 +107,9 @@ class DjangoSchemaCollector(BaseSchemaCollector):
             content = self._read_file(path)
             if not content:
                 continue
-            rel = str(path.relative_to(root))
-            tables = self._parse_model_file(content, rel)
+            rel_path = path.relative_to(root)
+            rel = str(rel_path)
+            tables = self._parse_model_file(content, rel, self._app_label(rel_path))
             snapshot.tables.extend(tables)
             if tables:
                 snapshot.raw_files_parsed += 1
@@ -102,7 +131,7 @@ class DjangoSchemaCollector(BaseSchemaCollector):
         return snapshot
 
     def _parse_model_file(
-        self, content: str, file_path: str
+        self, content: str, file_path: str, app_label: str | None = None
     ) -> list[TableDefinition]:
         tables = []
         class_blocks = re.split(r"(?=^class\s+\w+)", content, flags=re.MULTILINE)
@@ -113,8 +142,13 @@ class DjangoSchemaCollector(BaseSchemaCollector):
                 continue
 
             class_name = class_match.group(1)
-            # Django default table name: appname_modelname (lowercase)
-            table_name = class_name.lower()
+
+            # An abstract model contributes fields to its children and has no
+            # table of its own. Emitting one guarantees a false missing_table.
+            if RE_ABSTRACT.search(block):
+                continue
+
+            table_name = self._table_name(class_name, block, app_label)
 
             columns = []
             # Django auto-adds an 'id' PK unless overridden
@@ -144,9 +178,12 @@ class DjangoSchemaCollector(BaseSchemaCollector):
 
                 is_pk = bool(RE_PK.search(field_args))
 
-                fk_match = RE_FK_TO.search(field_match.group(0))
                 is_fk = field_type in ("ForeignKey", "OneToOneField")
-                fk_table = fk_match.group(1).lower() if fk_match else None
+                fk_table = (
+                    self._fk_target(field_match.group(0), table_name, app_label)
+                    if is_fk
+                    else None
+                )
 
                 # For FK fields, Django appends _id
                 col_name = f"{field_name}_id" if is_fk else field_name
@@ -198,6 +235,56 @@ class DjangoSchemaCollector(BaseSchemaCollector):
             file_path=file_path,
             operations=operations,
         )
+
+    @staticmethod
+    def _table_name(class_name: str, block: str, app_label: str | None) -> str:
+        """Resolve a model class to the table Django would create for it.
+
+        ``Meta.db_table`` is absolute when present. Otherwise the name is
+        ``<app_label>_<modelname>``; without an app label — a models.py at the
+        project root — the bare model name is the best available guess.
+
+        This matters more than it looks: drift is matched on table name, so
+        returning the bare model name for an app-prefixed table reports every
+        table in the project as missing and invites a CREATE TABLE for each
+        one that already exists.
+        """
+        db_table = RE_DB_TABLE.search(block)
+        if db_table:
+            return db_table.group(1)
+        if app_label:
+            return f"{app_label}_{class_name}".lower()
+        return class_name.lower()
+
+    @staticmethod
+    def _fk_target(
+        field_source: str, own_table: str, app_label: str | None
+    ) -> str | None:
+        """Resolve a relation's target to the table name it references.
+
+        Handles the four spellings Django accepts: "app.Model", "Model",
+        "self", and a bare class reference.
+
+        Limitation, deliberate: if the *referenced* model overrides its own
+        Meta.db_table, that override cannot be seen from this field alone, so
+        the convention name is returned. Nothing in drift.py or migration.py
+        reads foreign_key_table today, so this is reporting metadata rather
+        than something that can generate a wrong statement.
+        """
+        match = RE_FK_TO.search(field_source)
+        if not match:
+            return None
+        target = match.group(1) or match.group(2)
+        if not target:
+            return None
+        if target == "self":
+            return own_table
+        if "." in target:
+            app, _, model = target.rpartition(".")
+            return f"{app}_{model}".lower()
+        if app_label:
+            return f"{app_label}_{target}".lower()
+        return target.lower()
 
     def _read_file(self, path: Path) -> str | None:
         try:
